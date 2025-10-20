@@ -1,0 +1,238 @@
+
+#!/usr/bin/env python3
+
+import argparse
+import requests
+import re
+import time
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+# --- Configurações --- #
+VERSION = "0.1.0"
+SCRIPT_NAME = "Pegasus Vulnerability Scanner"
+
+# --- Padrões de SQL Injection (para fins educativos) --- #
+# Estes padrões são simplificados e visam demonstrar a lógica de detecção.
+# Em um ambiente real, seriam muito mais complexos e abrangentes.
+SQLI_PATTERNS = {
+    "Erro de Sintaxe": [
+        r"\\'", # Aspas simples que podem quebrar a query
+        r"\"" # Aspas duplas que podem quebrar a query
+    ],
+    "Injeção Booleana": [
+        r"AND\s+\d=\d", # Ex: AND 1=1, AND 1=2
+        r"OR\s+\d=\d",  # Ex: OR 1=1, OR 1=0
+        r"HAVING\s+\d=\d" # Ex: HAVING 1=1
+    ],
+    "Injeção Baseada em Tempo": [
+        r"SLEEP\(\d+\)", # MySQL/PostgreSQL
+        r"WAITFOR\s+DELAY\s+\'\d+:\d+:\d+\'", # MSSQL
+        r"PG_SLEEP\(\d+\)" # PostgreSQL
+    ],
+    "Comentário SQL": [
+        r"--\s*", # Comentário de linha (MySQL, PostgreSQL, MSSQL)
+        r"#",      # Comentário de linha (MySQL)
+        r"/\*.*?\*/" # Comentário de bloco
+    ],
+    "UNION SELECT": [
+        r"UNION\s+SELECT" # Ex: UNION SELECT null,null
+    ],
+    "Funções de Banco de Dados": [
+        r"VERSION\(\)", # MySQL
+        r"@@VERSION",   # MSSQL
+        r"USER\(\)",    # MySQL
+        r"CURRENT_USER", # PostgreSQL
+        r"DATABASE\(\)" # MySQL
+    ]
+}
+
+# --- Funções de Análise --- #
+
+def analyze_string_for_sqli(input_string):
+    """Analisa uma string genérica em busca de padrões de SQL Injection."""
+    print(f"[INFO] Analisando string: '{input_string}'")
+    vulnerabilities = []
+
+    for vuln_type, patterns in SQLI_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, input_string, re.IGNORECASE):
+                vulnerabilities.append({
+                    "type": vuln_type,
+                    "pattern": pattern,
+                    "description": f"Potencial {vuln_type} detectada com o padrão: '{pattern}' na string de entrada."
+                })
+
+    return vulnerabilities
+
+def apply_payload_to_url(original_url, param_name, payload):
+    parsed_url = urlparse(original_url)
+    query_params = parse_qs(parsed_url.query)
+
+    if param_name not in query_params:
+        # Se o parâmetro não existe, adiciona-o. Isso é uma simplificação.
+        # Em um cenário real, precisaríamos de uma forma de identificar o ponto de injeção.
+        print(f"[AVISO] Parâmetro '{param_name}' não encontrado na URL. Adicionando-o para teste.")
+        query_params[param_name] = [payload]
+    else:
+        # Assume que o primeiro valor do parâmetro é o alvo
+        original_value = query_params[param_name][0]
+        query_params[param_name][0] = original_value + payload
+    
+    new_query = urlencode(query_params, doseq=True)
+    return urlunparse(parsed_url._replace(query=new_query))
+
+def analyze_url_for_sqli(url):
+    """Analisa uma URL em busca de potenciais vulnerabilidades de SQL Injection."""
+    print(f"[INFO] Analisando URL: '{url}'")
+    vulnerabilities = []
+    base_content = ""
+
+    # Tenta identificar um parâmetro na URL para injetar
+    parsed_url = urlparse(url)
+    query_params = parse_qs(parsed_url.query)
+    
+    if not query_params:
+        vulnerabilities.append({
+            "type": "Requisito de URL",
+            "pattern": "N/A",
+            "description": "A URL fornecida não contém parâmetros de query. Por favor, forneça uma URL com parâmetros (ex: http://exemplo.com/pagina.php?id=1) para análise de injeção SQL."
+        })
+        return vulnerabilities
+
+    # Escolhe o primeiro parâmetro encontrado para testar
+    param_to_test = list(query_params.keys())[0]
+    print(f"[INFO] Testando o parâmetro: '{param_to_test}'")
+
+    try:
+        # Obter o conteúdo base da página sem payloads
+        response_base = requests.get(url, timeout=10)
+        response_base.raise_for_status() # Levanta HTTPError para códigos de status de erro (4xx ou 5xx)
+        base_content = response_base.text
+        print("[INFO] Conteúdo base da URL obtido com sucesso.")
+
+    except requests.exceptions.RequestException as e:
+        vulnerabilities.append({
+            "type": "Erro de Conexão",
+            "pattern": "N/A",
+            "description": f"Erro ao acessar a URL base: {e}"
+        })
+        return vulnerabilities
+
+    # Teste de Injeção SQL baseada em Erro (aspas simples)
+    print("[INFO] Testando injeção SQL baseada em erro com aspas simples...")
+    payload_error = "'"
+    test_url_error = apply_payload_to_url(url, param_to_test, payload_error)
+    try:
+        response_error = requests.get(test_url_error, timeout=10)
+        if response_error.status_code == 500 or \
+           re.search(r"sql syntax|mysql error|odbc error|jdbc error|syntax error|unclosed quotation mark", response_error.text, re.IGNORECASE):
+            vulnerabilities.append({
+                "type": "Potencial Injeção SQL Baseada em Erro",
+                "pattern": payload_error,
+                "description": f"A URL '{url}' pode ser vulnerável a injeção SQL baseada em erro com payload '{payload_error}'. Status: {response_error.status_code}"
+            })
+    except requests.exceptions.RequestException as e:
+        print(f"[AVISO] Erro ao testar payload de erro: {e}")
+
+    # Teste de Injeção SQL Booleana (AND 1=1 vs AND 1=2)
+    print("[INFO] Testando injeção SQL booleana...")
+    payload_true = "+AND+1=1"
+    payload_false = "+AND+1=2"
+
+    test_url_true = apply_payload_to_url(url, param_to_test, payload_true)
+    test_url_false = apply_payload_to_url(url, param_to_test, payload_false)
+
+    try:
+        response_true = requests.get(test_url_true, timeout=10)
+        response_false = requests.get(test_url_false, timeout=10)
+
+        # Se o conteúdo for significativamente diferente, pode indicar injeção booleana
+        if response_true.status_code == 200 and response_false.status_code == 200:
+            # Uma forma simples de comparar: verificar se o conteúdo de 'true' é mais parecido com o base
+            # e o de 'false' é diferente do base ou do 'true'.
+            # Isso é uma simplificação, em um cenário real seria mais complexo.
+            if len(response_true.text) > len(response_false.text) and len(response_false.text) < len(base_content):
+                vulnerabilities.append({
+                    "type": "Potencial Injeção SQL Booleana",
+                    "pattern": f"'{payload_true}' vs '{payload_false}'",
+                    "description": f"A URL '{url}' pode ser vulnerável a injeção SQL booleana. Respostas para '{payload_true}' e '{payload_false}' são diferentes."
+                })
+
+    except requests.exceptions.RequestException as e:
+        print(f"[AVISO] Erro ao testar payload booleano: {e}")
+
+    # Teste de Injeção SQL baseada em Tempo (com atraso)
+    print("[INFO] Testando injeção SQL baseada em tempo...")
+    payload_time = "+AND+SLEEP(5)" # Payload de exemplo para MySQL/PostgreSQL
+    test_url_time = apply_payload_to_url(url, param_to_test, payload_time)
+
+    try:
+        start_time = time.time()
+        response_time = requests.get(test_url_time, timeout=15) # Aumentar timeout para o teste de tempo
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+
+        if elapsed_time > 5: # Se o tempo de resposta for significativamente maior que o esperado
+            vulnerabilities.append({
+                "type": "Potencial Injeção SQL Baseada em Tempo",
+                "pattern": payload_time,
+                "description": f"A URL '{url}' pode ser vulnerável a injeção SQL baseada em tempo. Tempo de resposta: {elapsed_time:.2f}s (esperado > 5s)."
+            })
+    except requests.exceptions.RequestException as e:
+        print(f"[AVISO] Erro ao testar payload de tempo: {e}")
+
+    return vulnerabilities
+
+# --- Função Principal --- #
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"{SCRIPT_NAME} - Ferramenta de análise de vulnerabilidades (v{VERSION})"
+    )
+    parser.add_argument(
+        "-u", "--url", 
+        help="URL para analisar potenciais vulnerabilidades de SQL Injection. Ex: http://exemplo.com/pagina.php?id=1"
+    )
+    parser.add_argument(
+        "-s", "--string", 
+        help="String genérica para analisar padrões de SQL Injection."
+    )
+    parser.add_argument(
+        "-v", "--version", 
+        action="version", 
+        version=f"%(prog)s {VERSION}",
+        help="Exibe a versão do script."
+    )
+
+    args = parser.parse_args()
+
+    print(f"\n{'='*50}")
+    print(f"  {SCRIPT_NAME} - Análise de Vulnerabilidades")
+    print(f"{'='*50}\n")
+
+    # --- Aviso de Uso Ético --- #
+    print("AVISO: Este script é para FINS EDUCATIVOS e de conscientização sobre segurança.")
+    print("NÃO utilize esta ferramenta para atividades ilegais ou antiéticas.")
+    print("O uso indevido pode resultar em consequências legais graves.\n")
+
+    if args.url:
+        results = analyze_url_for_sqli(args.url)
+        print(f"\n[RESULTADOS PARA URL: {args.url}]")
+        if results:
+            for vuln in results:
+                print(f"  - Tipo: {vuln['type']}\n    Padrão: {vuln['pattern']}\n    Descrição: {vuln['description']}")
+        else:
+            print("  Nenhuma vulnerabilidade potencial detectada (para os testes implementados).")
+    elif args.string:
+        results = analyze_string_for_sqli(args.string)
+        print(f"\n[RESULTADOS PARA STRING: '{args.string}']")
+        if results:
+            for vuln in results:
+                print(f"  - Tipo: {vuln['type']}\n    Padrão: {vuln['pattern']}\n    Descrição: {vuln['description']}")
+        else:
+            print("  Nenhuma vulnerabilidade potencial detectada.")
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+
